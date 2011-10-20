@@ -94,7 +94,11 @@ def create_application():
     an instance of webapp.WSGIApplication with all mapreduce handlers
     registered.
   """
-  return webapp.WSGIApplication(create_handlers_map(),
+
+  # md: scheinbar gibt es hier ein kompatibilitaetsproblem mit der python 2.7 runtime
+  import config
+  import gaetk.webapp2
+  return gaetk.webapp2.WSGIApplication(create_handlers_map(),
                                 debug=True)
 
 
