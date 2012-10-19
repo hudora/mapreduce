@@ -41,6 +41,11 @@ from mapreduce import operation
 from mapreduce import quota
 from mapreduce import util
 
+try:
+  from google.appengine.ext import ndb
+except ImportError:
+  ndb = None
+
 
 # TODO(user): Make this a product of the reader or in quotas.py
 _QUOTA_BATCH_SIZE = 20
@@ -52,20 +57,12 @@ _SLICE_DURATION_SEC = 15
 # Delay between consecutive controller callback invocations.
 _CONTROLLER_PERIOD_SEC = 2
 
+# How many times to cope with a RetrySliceError before totally
+# giving up and aborting the whole job.
+_RETRY_SLICE_ERROR_MAX_RETRIES = 10
+
 # Set of strings of various test-injected faults.
 _TEST_INJECTED_FAULTS = set()
-
-
-class Error(Exception):
-  """Base class for exceptions in this module."""
-
-
-class NotEnoughArgumentsError(Error):
-  """Required argument is missing."""
-
-
-class NoDataError(Error):
-  """There is no data present for a desired input."""
 
 
 def _run_task_hook(hooks, method, task, queue_name):
@@ -134,10 +131,8 @@ class MapperWorkerCallbackHandler(util.HugeTaskHandler):
     if control and control.command == model.MapreduceControl.ABORT:
       logging.info("Abort command received by shard %d of job '%s'",
                    shard_state.shard_number, shard_state.mapreduce_id)
-      if tstate.output_writer:
-        tstate.output_writer.finalize(ctx, shard_state.shard_number)
-      # We recieved a command to abort. We don't care if we override
-      # some data.
+      # NOTE: When aborting, specifically do not finalize the output writer
+      # because it might be in a bad state.
       shard_state.active = False
       shard_state.result_status = model.ShardState.RESULT_ABORTED
       shard_state.put(config=util.create_datastore_write_config(spec))
@@ -154,6 +149,16 @@ class MapperWorkerCallbackHandler(util.HugeTaskHandler):
     else:
       quota_consumer = None
 
+    # Tell NDB to never cache anything in memcache or in-process. This ensures
+    # that entities fetched from Datastore input_readers via NDB will not bloat
+    # up the request memory size and Datastore Puts will avoid doing calls
+    # to memcache. Without this you get soft memory limit exits, which hurts
+    # overall throughput.
+    if ndb is not None:
+      ndb_ctx = ndb.get_context()
+      ndb_ctx.set_cache_policy(lambda key: False)
+      ndb_ctx.set_memcache_policy(lambda key: False)
+
     context.Context._set(ctx)
     try:
       # consume quota ahead, because we do not want to run a datastore
@@ -162,49 +167,67 @@ class MapperWorkerCallbackHandler(util.HugeTaskHandler):
         scan_aborted = False
         entity = None
 
-        # We shouldn't fetch an entity from the reader if there's not enough
-        # quota to process it. Perform all quota checks proactively.
-        if not quota_consumer or quota_consumer.consume():
-          for entity in input_reader:
-            if isinstance(entity, db.Model):
-              shard_state.last_work_item = repr(entity.key())
-            else:
-              shard_state.last_work_item = repr(entity)[:100]
+        try:
+          # We shouldn't fetch an entity from the reader if there's not enough
+          # quota to process it. Perform all quota checks proactively.
+          if not quota_consumer or quota_consumer.consume():
+            for entity in input_reader:
+              if isinstance(entity, db.Model):
+                shard_state.last_work_item = repr(entity.key())
+              else:
+                shard_state.last_work_item = repr(entity)[:100]
 
-            scan_aborted = not self.process_data(
-                entity, input_reader, ctx, tstate)
+              scan_aborted = not self.process_data(
+                  entity, input_reader, ctx, tstate)
 
-            # Check if we've got enough quota for the next entity.
-            if (quota_consumer and not scan_aborted and
-                not quota_consumer.consume()):
-              scan_aborted = True
-            if scan_aborted:
-              break
-        else:
+              # Check if we've got enough quota for the next entity.
+              if (quota_consumer and not scan_aborted and
+                  not quota_consumer.consume()):
+                scan_aborted = True
+              if scan_aborted:
+                break
+          else:
+            scan_aborted = True
+
+          if not scan_aborted:
+            logging.info("Processing done for shard %d of job '%s'",
+                         shard_state.shard_number, shard_state.mapreduce_id)
+            # We consumed extra quota item at the end of for loop.
+            # Just be nice here and give it back :)
+            if quota_consumer:
+              quota_consumer.put(1)
+            shard_state.active = False
+            shard_state.result_status = model.ShardState.RESULT_SUCCESS
+
+          operation.counters.Increment(
+              context.COUNTER_MAPPER_WALLTIME_MS,
+              int((time.time() - self._start_time)*1000))(ctx)
+
+          # TODO(user): Mike said we don't want this happen in case of
+          # exception while scanning. Figure out when it's appropriate to skip.
+          ctx.flush()
+        except errors.RetrySliceError, e:
+          logging.error("Slice error: %s", e)
+          retry_count = int(
+              os.environ.get("HTTP_X_APPENGINE_TASKRETRYCOUNT") or 0)
+          if retry_count <= _RETRY_SLICE_ERROR_MAX_RETRIES:
+            raise
+          logging.error("Too many retries: %d, failing the job", retry_count)
           scan_aborted = True
-
-
-        if not scan_aborted:
-          logging.info("Processing done for shard %d of job '%s'",
-                       shard_state.shard_number, shard_state.mapreduce_id)
-          # We consumed extra quota item at the end of for loop.
-          # Just be nice here and give it back :)
-          if quota_consumer:
-            quota_consumer.put(1)
           shard_state.active = False
-          shard_state.result_status = model.ShardState.RESULT_SUCCESS
-
-      operation.counters.Increment(
-          context.COUNTER_MAPPER_WALLTIME_MS,
-          int((time.time() - self._start_time)*1000))(ctx)
-
-      # TODO(user): Mike said we don't want this happen in case of
-      # exception while scanning. Figure out when it's appropriate to skip.
-      ctx.flush()
+          shard_state.result_status = model.ShardState.RESULT_FAILED
+        except errors.FailJobError, e:
+          logging.error("Job failed: %s", e)
+          scan_aborted = True
+          shard_state.active = False
+          shard_state.result_status = model.ShardState.RESULT_FAILED
 
       if not shard_state.active:
-        # shard is going to stop. Finalize output writer if any.
-        if tstate.output_writer:
+        # shard is going to stop. Don't finalize output writer unless the job is
+        # going to be successful, because writer might be stuck in some bad state
+        # otherwise.
+        if (shard_state.result_status == model.ShardState.RESULT_SUCCESS and
+            tstate.output_writer):
           tstate.output_writer.finalize(ctx, shard_state.shard_number)
 
       config = util.create_datastore_write_config(spec)
@@ -219,6 +242,8 @@ class MapperWorkerCallbackHandler(util.HugeTaskHandler):
       def tx():
         fresh_shard_state = db.get(
             model.ShardState.get_key_by_shard_id(shard_id))
+        if not fresh_shard_state:
+          raise db.Rollback()
         if (not fresh_shard_state.active or
             "worker_active_state_collision" in _TEST_INJECTED_FAULTS):
           shard_state.active = False
@@ -273,8 +298,6 @@ class MapperWorkerCallbackHandler(util.HugeTaskHandler):
               output_writer.write(output, ctx)
 
     if self._time() - self._start_time > _SLICE_DURATION_SEC:
-      logging.debug("Spent %s seconds. Rescheduling",
-                    self._time() - self._start_time)
       return False
     return True
 
@@ -372,11 +395,6 @@ class ControllerCallbackHandler(util.HugeTaskHandler):
     spec = model.MapreduceSpec.from_json_str(
         self.request.get("mapreduce_spec"))
 
-    # TODO(user): Make this logging prettier.
-    logging.debug("post: id=%s headers=%s spec=%s",
-                  spec.mapreduce_id, self.request.headers,
-                  self.request.get("mapreduce_spec"))
-
     state, control = db.get([
         model.MapreduceState.get_key_by_job_id(spec.mapreduce_id),
         model.MapreduceControl.get_key_by_job_id(spec.mapreduce_id),
@@ -407,6 +425,8 @@ class ControllerCallbackHandler(util.HugeTaskHandler):
       state.active_shards = len(active_shards)
       state.failed_shards = len(failed_shards)
       state.aborted_shards = len(aborted_shards)
+      if not control and failed_shards:
+        model.MapreduceControl.abort(spec.mapreduce_id)
 
     if (not state.active and control and
         control.command == model.MapreduceControl.ABORT):
@@ -512,9 +532,13 @@ class ControllerCallbackHandler(util.HugeTaskHandler):
       base_path: handler base path.
     """
     config = util.create_datastore_write_config(mapreduce_spec)
-    # Enqueue done_callback if needed.
-    if mapreduce_spec.mapper.output_writer_class():
+
+    # Only finalize the output writers if we the job is successful.
+    if (mapreduce_spec.mapper.output_writer_class() and
+        mapreduce_state.result_status == model.MapreduceState.RESULT_SUCCESS):
       mapreduce_spec.mapper.output_writer_class().finalize_job(mapreduce_state)
+
+    # Enqueue done_callback if needed.
     def put_state(state):
       state.put(config=config)
       done_callback = mapreduce_spec.params.get(
@@ -680,11 +704,11 @@ class KickOffJobHandler(util.HugeTaskHandler):
       parameter value
 
     Raises:
-      NotEnoughArgumentsError: if parameter is not specified.
+      errors.NotEnoughArgumentsError: if parameter is not specified.
     """
     value = self.request.get(param_name)
     if not value:
-      raise NotEnoughArgumentsError(param_name + " not specified")
+      raise errors.NotEnoughArgumentsError(param_name + " not specified")
     return value
 
   @classmethod
@@ -821,11 +845,11 @@ class StartJobHandler(base_handler.PostJsonHandler):
       parameter value
 
     Raises:
-      NotEnoughArgumentsError: if parameter is not specified.
+      errors.NotEnoughArgumentsError: if parameter is not specified.
     """
     value = self.request.get(param_name)
     if not value:
-      raise NotEnoughArgumentsError(param_name + " not specified")
+      raise errors.NotEnoughArgumentsError(param_name + " not specified")
     return value
 
   @classmethod

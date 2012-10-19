@@ -94,7 +94,6 @@ def create_application():
     an instance of webapp.WSGIApplication with all mapreduce handlers
     registered.
   """
-
   return webapp.WSGIApplication(create_handlers_map(),
                                 debug=True)
 
